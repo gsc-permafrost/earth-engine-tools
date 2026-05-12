@@ -1,0 +1,12 @@
+ee_project: 'earth-engine-working'
+start_year: 1985
+end_year: 2014
+aoi:
+  - [-115.0, 63.75]
+  - [-114.5, 63.75]
+  - [-114.5, 64.0]
+  - [-115.0, 64.0]
+  - [-115.0, 63.75]
+working_dir: 'D:\icing_mapping\mosaic_testing\yaml_test'
+cut_off_value: 2
+clip_to_aoi: True

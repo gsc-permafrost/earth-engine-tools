@@ -1,0 +1,7 @@
+*.*
+!*.gitignore
+!*.py
+!*.ipynb
+!*.md
+!requirements.txt
+!input_params.yaml

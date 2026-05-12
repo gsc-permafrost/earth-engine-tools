@@ -1,0 +1,12 @@
+numpy
+pandas
+geopandas
+rasterio
+earthengine-api
+geemap
+rasterio
+shapely
+google_auth_oauthlib
+pyogrio
+tabulate
+pyyaml
