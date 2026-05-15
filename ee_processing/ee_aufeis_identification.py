@@ -22,10 +22,8 @@ class EEAufeisIdentification(LandsatCollection):
     def __init__(self, project_name: str, aoi: list[list[float]], start_year: int, end_year: int, start_doy: int,
                  end_doy: int, satellites: list[int] = [5, 7, 8, 9], cloud_frac: int = 50, clip_to_aoi: bool = False):
 
-        def clip_collection_to_aoi(img):
-            return img.clip(self.aoi)
-
         super().__init__(project_name, aoi, start_doy, end_doy, satellites, cloud_frac)
+        self.clip_to_aoi = clip_to_aoi
         self.investigation_start_year = start_year
         self.investigation_end_year = end_year
 
@@ -55,12 +53,11 @@ class EEAufeisIdentification(LandsatCollection):
 
         # for data export and download
         self.crs = "EPSG:3979"
-        self.tile_size_px = 5000
+        self.tile_size_px = 1500
 
         # collection includes all imagery from 1985 to present within the specified DOY range
         self.collection = self.collection.map(self.image_classification)
-        if clip_to_aoi:
-            self.collection = self.collection.map(clip_collection_to_aoi)
+
         self.imagery_water_mask = None
         self.create_imagery_water_mask()
 
@@ -69,74 +66,87 @@ class EEAufeisIdentification(LandsatCollection):
         self.identify_aufeis()
         return
 
-    def generate_tiling_grid(self, image: ee.Image) -> ee.FeatureCollection:
+    def generate_tiling_grid(self) -> ee.FeatureCollection:
         """
-        Generates a tiling grid feature collection based on the bounds of the input image. The export grid is intended
-        to be used to split the image into multiple smaller export tasks instead of one massive one.
-
-        :param image: the image to be tiled
+        Generates a tiling grid feature collection based on the bounds of self.aoi or self.collection. The export grid
+        is intended to be used to split the image into multiple smaller export tasks instead of one massive one.
 
         :return: an earth engine feature collection (ee.FeatureCollection) representing the tiling grid
         """
-        # calculate tile dimensions in meters
         tile_dimension = self.output_pixel_size_m * self.tile_size_px
 
-        # get bounding box coordinates of the image
-        bounding_box = image.geometry().bounds(proj=self.crs, maxError=1)
-        coordinates = ee.Array.cat(bounding_box.coordinates(), 1)
+        # Use AOI if clipping, otherwise collection bounds
+        bounding_box = ee.Algorithms.If(condition=self.clip_to_aoi,
+                                        trueCase=self.aoi.bounds(proj=self.crs, maxError=1),
+                                        falseCase=self.collection.geometry().bounds(proj=self.crs, maxError=1))
 
-        # get top, bottom, left, right of image bounding box
-        x_min = coordinates.slice(1, 0, 1).reduce('min', [0]).get([0, 0])
-        y_min = coordinates.slice(1, 1, 2).reduce('min', [0]).get([0, 0])
-        x_max = coordinates.slice(1, 0, 1).reduce('max', [0]).get([0, 0])
-        y_max = coordinates.slice(1, 1, 2).reduce('max', [0]).get([0, 0])
+        bounding_box = ee.Geometry(bounding_box)
+        bbox_coords = ee.Array.cat(bounding_box.coordinates(), 1)
+        x_min = ee.Number(bbox_coords.slice(1, 0, 1).reduce('min', [0]).get([0, 0]))
+        y_min = ee.Number(bbox_coords.slice(1, 1, 2).reduce('min', [0]).get([0, 0]))
+        x_max = ee.Number(bbox_coords.slice(1, 0, 1).reduce('max', [0]).get([0, 0]))
+        y_max = ee.Number(bbox_coords.slice(1, 1, 2).reduce('max', [0]).get([0, 0]))
 
-        x_diff = x_max.subtract(x_min).getInfo()
-        y_diff = y_max.subtract(y_min).getInfo()
-        if x_diff < tile_dimension and y_diff < tile_dimension:
-            vertices = [[x_min, y_min],
-                        [x_max, y_min],
-                        [x_max, y_max],
-                        [x_min, y_max],
-                        [x_min, y_min]]
-            grid = ee.FeatureCollection([ee.Feature(ee.Geometry.Polygon(coords=vertices, proj=self.crs, evenOdd=False),
-                                                    {"id": f"tile_", "value": 1})])
-            return grid
+        x_diff = x_max.subtract(x_min)
+        y_diff = y_max.subtract(y_min)
 
-        # calculate origin of tiling grid
-        ll_padding = 1
-        lower_left_x = (x_min.divide(self.output_pixel_size_m).int().subtract(ll_padding)
-                        .multiply(self.output_pixel_size_m))
-        lower_left_y = (y_min.divide(self.output_pixel_size_m).int().subtract(ll_padding)
-                        .multiply(self.output_pixel_size_m))
+        # Small case (single tile)
+        def make_single_tile():
+            vertices = ee.List([[x_min, y_min],
+                                [x_max, y_min],
+                                [x_max, y_max],
+                                [x_min, y_max],
+                                [x_min, y_min]])
+            return ee.FeatureCollection([ee.Feature(ee.Geometry.Polygon(coords=vertices, proj=self.crs, evenOdd=False),
+                                                    {"id": "tile_0", "value": 0})])
 
-        # calculate tiling grid dimensions in tiles
-        y_diff = y_max.subtract(lower_left_y)
-        x_diff = x_max.subtract(lower_left_x)
-        num_tiles_x = x_diff.divide(tile_dimension).int().add(1).getInfo()
-        num_tiles_y = y_diff.divide(tile_dimension).int().add(1).getInfo()
+        # Multi-tile case
+        def make_grid():
+            ll_padding = 1
 
-        #  generate tiles
-        tile_number = 0
-        tiles = list()
-        for ix in range(num_tiles_x):
-            for iy in range(num_tiles_y):
-                bottom = lower_left_y.add(tile_dimension * iy)
-                left = lower_left_x.add(tile_dimension * ix)
-                top = lower_left_y.add(tile_dimension * (iy + 1))
-                right = lower_left_x.add(tile_dimension * (ix + 1))
+            lower_left_x = x_min.divide(self.output_pixel_size_m).int().subtract(ll_padding).multiply(
+                self.output_pixel_size_m)
+            lower_left_y = y_min.divide(self.output_pixel_size_m).int().subtract(ll_padding).multiply(
+                self.output_pixel_size_m)
 
-                vertices = [[left, bottom],
-                            [right, bottom],
-                            [right, top],
-                            [left, top],
-                            [left, bottom]]
-                tiles.append(ee.Feature(ee.Geometry.Polygon(coords=vertices, proj=self.crs, evenOdd=False),
-                                        {"id": f"tile_{tile_number}", "value": tile_number}))
-                tile_number += 1
-        # compile tiles into feature collection and remove any which do not intersect the original image bounds
-        grid = ee.FeatureCollection(tiles)
-        return grid.filter(ee.Filter.intersects('.geo', image.geometry()))
+            x_range = x_max.subtract(lower_left_x)
+            y_range = y_max.subtract(lower_left_y)
+
+            num_tiles_x = x_range.divide(tile_dimension).int().add(1)
+            num_tiles_y = y_range.divide(tile_dimension).int().add(1)
+
+            x_indices = ee.List.sequence(0, num_tiles_x.subtract(1))
+            y_indices = ee.List.sequence(0, num_tiles_y.subtract(1))
+
+            def make_column(ix):
+                ix = ee.Number(ix)
+
+                def make_tile(iy):
+                    iy = ee.Number(iy)
+
+                    left = lower_left_x.add(ix.multiply(tile_dimension))
+                    bottom = lower_left_y.add(iy.multiply(tile_dimension))
+                    right = left.add(tile_dimension)
+                    top = bottom.add(tile_dimension)
+
+                    coords = ee.List([[left, bottom],
+                                      [right, bottom],
+                                      [right, top],
+                                      [left, top],
+                                      [left, bottom]])
+
+                    tile_id = ix.multiply(num_tiles_y).add(iy)
+
+                    return ee.Feature(ee.Geometry.Polygon(coords=coords, proj=self.crs, evenOdd=False),
+                                      {"id": tile_id.format("tile_%d"), "value": tile_id})
+                return y_indices.map(make_tile)
+            tiles = x_indices.map(make_column).flatten()
+
+            return ee.FeatureCollection(tiles).filter(ee.Filter.intersects('.geo', bounding_box))
+
+        return ee.FeatureCollection(ee.Algorithms.If(condition=x_diff.lt(tile_dimension).And(y_diff.lt(tile_dimension)),
+                                                     trueCase=make_single_tile(),
+                                                     falseCase=make_grid()))
 
     def download_aufeis_data(self, download_dir: str | Path, dry_run: bool = False) \
             -> tuple[ee.Image, ee.FeatureCollection]:
@@ -166,30 +176,32 @@ class EEAufeisIdentification(LandsatCollection):
                                                      .multiply(4).int().rename(f"aufeis_{year}"))
                 output_image = output_image.addBands(image.select("data_present").rename(f"pixel_counts_{year}"))
         # add the water mask, terrain mask, and interannual aufeis to the output image
-        zeros = ee.Image.constant(0).clip(output_image.geometry().bounds()).rename("zeros")
+        zeros = ee.Image.constant(0).rename("zeros")  # .clip(output_image.geometry().bounds())
         water_mask = zeros.where(self.gsw_water_mask.eq(1), 1).int().rename("water_mask")
         terrain_mask = zeros.where(self.combined_terrain_mask.eq(1), 1).int().rename("terrain_mask")
         output_image = (output_image.addBands(water_mask).addBands(terrain_mask)
                         .addBands(self.interannual_aufeis.select("interannual_aufeis").int())
                         .addBands(self.interannual_aufeis.select("years_with_data").int())
                         .addBands(self.interannual_aufeis.select("years_flagged_as_wet_snow").int())
-                        .addBands(self.interannual_aufeis.select("total_aufeis").int())
-                        .reproject(crs=self.crs, scale=self.output_pixel_size_m))
+                        .addBands(self.interannual_aufeis.select("total_aufeis").int()))
 
         #  generate tiling grid
-        filtered_grid = self.generate_tiling_grid(image=output_image)
-        tile_ids = filtered_grid.aggregate_array('system:index').getInfo()
+        filtered_grid = self.generate_tiling_grid()
+        if dry_run:
+            return output_image, filtered_grid
 
         # for each tile submit an export task
         google_folder = f"aufeis_data_{dt.datetime.now().strftime('%Y%m%dT%H%M%S')}"
-        if dry_run:
-            return output_image, filtered_grid
+
+        grid_size = filtered_grid.size().getInfo()
+        feature_list = filtered_grid.toList(grid_size)
+
         task_list = list()
-        for i, tile_id in enumerate(tile_ids):
-            feature = ee.Feature(filtered_grid.toList(1, i).get(0))
+        for i in range(grid_size):
+            feature = ee.Feature(feature_list.get(i))
             geometry = feature.geometry()
             task_name = f"tile_{i}"
-            task = ee.batch.Export.image.toDrive(image=output_image.unmask(99),
+            task = ee.batch.Export.image.toDrive(image=output_image,   # .unmask(99),
                                                  description=task_name,
                                                  fileNamePrefix=task_name,
                                                  fileFormat='GeoTIFF',
@@ -408,7 +420,7 @@ class EEAufeisIdentification(LandsatCollection):
                 single_year_aufeis.select("aufeis").multiply(0).add(1).int().rename("data_present"))
             aufeis_all_years.append(single_year_aufeis)
             if self.investigation_start_year <= year <= self.investigation_end_year:
-                single_year_aufeis = single_year_aufeis.clip(self.collection.geometry().bounds())
+                # single_year_aufeis = single_year_aufeis.clip(self.collection.geometry().bounds())
                 self.aufeis_investigation_years[year] = single_year_aufeis
 
         # aggregate yearly aufeis information to calculate self.interannual_aufeis
@@ -428,7 +440,7 @@ class EEAufeisIdentification(LandsatCollection):
 
         self.interannual_aufeis = (self.interannual_aufeis.addBands(total_aufeis).addBands(total_years_flagged)
                                    .addBands(total_years_with_data).addBands(aufeis_score))
-        self.interannual_aufeis = self.interannual_aufeis.clip(self.collection.geometry().bounds())
+        # self.interannual_aufeis = self.interannual_aufeis.clip(self.collection.geometry().bounds())
 
         # add constrained_aufeis band to images in self.aufeis_investigation_years
         for year, image in self.aufeis_investigation_years.items():

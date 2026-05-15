@@ -35,7 +35,7 @@ def main():
     vectorized_dir = Path(working_dir, "vectorized")
     output_dir = Path(working_dir, "compiled_aufeis")
     for dir_path in [download_dir, vectorized_dir, output_dir]:
-        dir_path.mkdir(exist_ok=True)
+        dir_path.mkdir(exist_ok=True, parents=True)
 
     # create GEE layers
     aufeis = EEAufeisIdentification(project_name=ee_project,
