@@ -149,7 +149,7 @@ class EEAufeisIdentification(LandsatCollection):
                                                      falseCase=make_grid()))
 
     def download_aufeis_data(self, download_dir: str | Path, dry_run: bool = False) \
-            -> tuple[ee.Image, ee.FeatureCollection]:
+            -> tuple[dict, ee.FeatureCollection]:
         """
         compiles the relevent data in self.aufeis_investigation_years into a single image, submits an export task, waits
         for the export to complete, then downloads the data from google drive.
@@ -165,30 +165,49 @@ class EEAufeisIdentification(LandsatCollection):
 
         :return: filtered_grid: tiling grid feature collection returned by 'generate_tiling_grid'
         """
-        #  compile self.aufeis_investigation_years into a single image
-        output_image = None
+        #  compile self.aufeis_investigation_years into images covering 5 year blocks
+        block_size = 5
+        year_range = self.investigation_end_year - self.investigation_start_year
+        if year_range % block_size == 0:
+            num_blocks = int(year_range / block_size)
+        else:
+            num_blocks = int(year_range / block_size) + 1
+        block_starts = [self.investigation_start_year + (i * block_size) for i in range(num_blocks)]
+        block_assignment = dict()
+        for year in self.aufeis_investigation_years.keys():
+            for bs in block_starts:
+                be = bs + block_size
+                if be > year >= bs:
+                    block_assignment[year] = bs
+                    break
+
+        output_images = {bs: None for bs in block_starts}
         for year, image in self.aufeis_investigation_years.items():
-            if output_image is None:
-                output_image = image.select("aufeis").multiply(4).int().rename(f"aufeis_{year}")
-                output_image = output_image.addBands(image.select("data_present").rename(f"pixel_counts_{year}"))
+            year_block = block_assignment[year]
+            if output_images[year_block] is None:
+                output_images[year_block] = image.select("aufeis").multiply(4).int().rename(f"aufeis_{year}")
+                output_images[year_block] = (
+                    output_images[year_block].addBands(image.select("data_present").rename(f"pixel_counts_{year}")))
             else:
-                output_image = output_image.addBands(image.select("aufeis")
-                                                     .multiply(4).int().rename(f"aufeis_{year}"))
-                output_image = output_image.addBands(image.select("data_present").rename(f"pixel_counts_{year}"))
+                output_images[year_block] = (
+                    output_images[year_block].addBands(image.select("aufeis").multiply(4).int().rename(f"aufeis_{year}")))
+                output_images[year_block] = (
+                    output_images[year_block].addBands(image.select("data_present").rename(f"pixel_counts_{year}")))
         # add the water mask, terrain mask, and interannual aufeis to the output image
         zeros = ee.Image.constant(0).rename("zeros")  # .clip(output_image.geometry().bounds())
         water_mask = zeros.where(self.gsw_water_mask.eq(1), 1).int().rename("water_mask")
         terrain_mask = zeros.where(self.combined_terrain_mask.eq(1), 1).int().rename("terrain_mask")
-        output_image = (output_image.addBands(water_mask).addBands(terrain_mask)
-                        .addBands(self.interannual_aufeis.select("interannual_aufeis").int())
-                        .addBands(self.interannual_aufeis.select("years_with_data").int())
-                        .addBands(self.interannual_aufeis.select("years_flagged_as_wet_snow").int())
-                        .addBands(self.interannual_aufeis.select("total_aufeis").int()))
+        output_images[block_starts[-1]] = (
+            output_images[block_starts[-1]].addBands(water_mask).addBands(terrain_mask)
+            .addBands(self.interannual_aufeis.select("interannual_aufeis").int())
+            .addBands(self.interannual_aufeis.select("years_with_data").int())
+            .addBands(self.interannual_aufeis.select("years_flagged_as_wet_snow").int())
+            .addBands(self.interannual_aufeis.select("total_aufeis").int()))
 
         #  generate tiling grid
         filtered_grid = self.generate_tiling_grid()
         if dry_run:
-            return output_image, filtered_grid
+            return output_images, filtered_grid
 
         # for each tile submit an export task
         google_folder = f"aufeis_data_{dt.datetime.now().strftime('%Y%m%dT%H%M%S')}"
@@ -198,26 +217,27 @@ class EEAufeisIdentification(LandsatCollection):
 
         task_list = list()
         for i in range(grid_size):
-            feature = ee.Feature(feature_list.get(i))
-            geometry = feature.geometry()
-            task_name = f"tile_{i}"
-            task = ee.batch.Export.image.toDrive(image=output_image,   # .unmask(99),
-                                                 description=task_name,
-                                                 fileNamePrefix=task_name,
-                                                 fileFormat='GeoTIFF',
-                                                 folder=google_folder,
-                                                 crs=self.crs,
-                                                 scale=self.output_pixel_size_m,
-                                                 region=geometry,
-                                                 maxPixels=int(1e10))
-            task.start()
-            task_list.append(task)
+            for key, output_image in output_images.items():
+                feature = ee.Feature(feature_list.get(i))
+                geometry = feature.geometry()
+                task_name = f"y{key}_tile_{i}"
+                task = ee.batch.Export.image.toDrive(image=output_image,   # .unmask(99),
+                                                     description=task_name,
+                                                     fileNamePrefix=task_name,
+                                                     fileFormat='GeoTIFF',
+                                                     folder=google_folder,
+                                                     crs=self.crs,
+                                                     scale=self.output_pixel_size_m,
+                                                     region=geometry,
+                                                     maxPixels=int(1e10))
+                task.start()
+                task_list.append(task)
         # wait for all tasks to complete then download the data
         download_from_google_drive(task_list=task_list,
                                    google_folder=google_folder,
                                    local_download_loc=download_dir,
                                    extract_from_folder=True)
-        return output_image, filtered_grid
+        return output_images, filtered_grid
 
     def image_classification(self, image):
         # Get bands and apply classification logic
@@ -286,7 +306,7 @@ class EEAufeisIdentification(LandsatCollection):
         image = image.addBands(other)
         return image
 
-    # ## Spatial Filtering ##
+    # Spatial Filtering
     def change_resolution(self, image):
         max_pixels = int(np.square(self.downsample_scaling_factor + 1))
         resolution = self.downsample_scaling_factor * self.output_pixel_size_m
