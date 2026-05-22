@@ -15,7 +15,8 @@ from .static_masks import StaticMasks
 
 
 class LandsatCollection(StaticMasks):
-    def __init__(self, project_name, aoi, start_doy, end_doy, satellites, cloud_frac):
+    def __init__(self, project_name: str, aoi: list[list[float]], start_doy: int, end_doy: int, start_year: int = 1985,
+                 end_year: int = None, satellites: list[int] = [9, 8, 7, 5], cloud_frac: int = 50):
 
         def merge_collections(new, current):
             return ee.ImageCollection(current).merge(new)
@@ -24,6 +25,15 @@ class LandsatCollection(StaticMasks):
         self.aoi = ee.Geometry.Polygon(coords=aoi)
         self.start_doy = start_doy
         self.end_doy = end_doy
+        self.start_year = start_year
+        if end_year is None:
+            doy_today = dt.datetime.now().timetuple().tm_yday
+            if doy_today > self.end_doy:
+                self.end_year = dt.datetime.now().year
+            else:
+                self.end_year = dt.datetime.now().year - 1
+        else:
+            self.end_year = end_year
         self.cloud_frac = cloud_frac
         self.optical_bands = None
         self.thermal_bands = None
@@ -40,11 +50,6 @@ class LandsatCollection(StaticMasks):
         return
 
     def get_collections(self, number, path):
-        doy_today = dt.datetime.now().timetuple().tm_yday
-        if doy_today > self.end_doy:
-            end_year = dt.datetime.now().year
-        else:
-            end_year = dt.datetime.now().year - 1
 
         if number >= 8:
             self.optical_bands = [['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7'],
@@ -55,7 +60,7 @@ class LandsatCollection(StaticMasks):
                                   ['blue', 'green', 'red', 'nir', 'swir1', 'swir2']]
             self.thermal_bands = [['ST_B6'], ['lwir']]
         collection = ee.ImageCollection(path).filter(ee.Filter.And(
-            ee.Filter.calendarRange(1985, end_year, 'year'),
+            ee.Filter.calendarRange(self.start_year, self.end_year, 'year'),
             ee.Filter.calendarRange(self.start_doy, self.end_doy, 'day_of_year'),
             ee.Filter.lt("CLOUD_COVER_LAND", self.cloud_frac),
             ee.Filter.bounds(self.aoi)

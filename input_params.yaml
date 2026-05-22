@@ -1,5 +1,5 @@
 ee_project: 'earth-engine-working'
-start_year: 1985
+start_year: 2009
 end_year: 2014
 aoi:
   - [-115.0, 63.75]

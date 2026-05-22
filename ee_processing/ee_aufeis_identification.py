@@ -22,10 +22,17 @@ class EEAufeisIdentification(LandsatCollection):
     def __init__(self, project_name: str, aoi: list[list[float]], start_year: int, end_year: int, start_doy: int,
                  end_doy: int, satellites: list[int] = [5, 7, 8, 9], cloud_frac: int = 50, clip_to_aoi: bool = False):
 
-        super().__init__(project_name, aoi, start_doy, end_doy, satellites, cloud_frac)
+        super().__init__(project_name=project_name,
+                         aoi=aoi,
+                         start_doy=start_doy,
+                         end_doy=end_doy,
+                         satellites=satellites,
+                         cloud_frac=cloud_frac,
+                         start_year=start_year,
+                         end_year=end_year)
         self.clip_to_aoi = clip_to_aoi
-        self.investigation_start_year = start_year
-        self.investigation_end_year = end_year
+        # self.investigation_start_year = start_year
+        # self.investigation_end_year = end_year
 
         # For cloud/water masks
         self.ndsi_masking_threshold = 0.4
@@ -55,14 +62,12 @@ class EEAufeisIdentification(LandsatCollection):
         self.crs = "EPSG:3979"
         self.tile_size_px = 1500
 
-        # collection includes all imagery from 1985 to present within the specified DOY range
         self.collection = self.collection.map(self.image_classification)
 
         self.imagery_water_mask = None
         self.create_imagery_water_mask()
 
-        self.interannual_aufeis = None
-        self.aufeis_investigation_years = None
+        self.aufeis = None
         self.identify_aufeis()
         return
 
@@ -148,8 +153,7 @@ class EEAufeisIdentification(LandsatCollection):
                                                      trueCase=make_single_tile(),
                                                      falseCase=make_grid()))
 
-    def download_aufeis_data(self, download_dir: str | Path, dry_run: bool = False) \
-            -> tuple[dict, ee.FeatureCollection]:
+    def download_aufeis_data(self, download_dir: str | Path, dry_run: bool = False) -> ee.FeatureCollection:
         """
         compiles the relevent data in self.aufeis_investigation_years into a single image, submits an export task, waits
         for the export to complete, then downloads the data from google drive.
@@ -165,62 +169,32 @@ class EEAufeisIdentification(LandsatCollection):
 
         :return: filtered_grid: tiling grid feature collection returned by 'generate_tiling_grid'
         """
-        #  compile self.aufeis_investigation_years into images covering 5 year blocks
-        block_size = 5
-        year_range = self.investigation_end_year - self.investigation_start_year
-        if year_range % block_size == 0:
-            num_blocks = int(year_range / block_size)
-        else:
-            num_blocks = int(year_range / block_size) + 1
-        block_starts = [self.investigation_start_year + (i * block_size) for i in range(num_blocks)]
-        block_assignment = dict()
-        for year in self.aufeis_investigation_years.keys():
-            for bs in block_starts:
-                be = bs + block_size
-                if be > year >= bs:
-                    block_assignment[year] = bs
-                    break
-
-        output_images = {bs: None for bs in block_starts}
-        for year, image in self.aufeis_investigation_years.items():
-            year_block = block_assignment[year]
-            if output_images[year_block] is None:
-                output_images[year_block] = image.select("aufeis").multiply(4).int().rename(f"aufeis_{year}")
-                output_images[year_block] = (
-                    output_images[year_block].addBands(image.select("data_present").rename(f"pixel_counts_{year}")))
-            else:
-                output_images[year_block] = (
-                    output_images[year_block].addBands(image.select("aufeis").multiply(4).int().rename(f"aufeis_{year}")))
-                output_images[year_block] = (
-                    output_images[year_block].addBands(image.select("data_present").rename(f"pixel_counts_{year}")))
-        # add the water mask, terrain mask, and interannual aufeis to the output image
-        zeros = ee.Image.constant(0).rename("zeros")  # .clip(output_image.geometry().bounds())
-        water_mask = zeros.where(self.gsw_water_mask.eq(1), 1).int().rename("water_mask")
-        terrain_mask = zeros.where(self.combined_terrain_mask.eq(1), 1).int().rename("terrain_mask")
-        output_images[block_starts[-1]] = (
-            output_images[block_starts[-1]].addBands(water_mask).addBands(terrain_mask)
-            .addBands(self.interannual_aufeis.select("interannual_aufeis").int())
-            .addBands(self.interannual_aufeis.select("years_with_data").int())
-            .addBands(self.interannual_aufeis.select("years_flagged_as_wet_snow").int())
-            .addBands(self.interannual_aufeis.select("total_aufeis").int()))
 
         #  generate tiling grid
         filtered_grid = self.generate_tiling_grid()
         if dry_run:
-            return output_images, filtered_grid
+            return filtered_grid
 
-        # for each tile submit an export task
+        # for each tile and image submit an export task
         google_folder = f"aufeis_data_{dt.datetime.now().strftime('%Y%m%dT%H%M%S')}"
 
         grid_size = filtered_grid.size().getInfo()
         feature_list = filtered_grid.toList(grid_size)
 
+        zeros = ee.Image.constant(0).rename("zeros")
+        water_mask = zeros.where(self.imagery_water_mask.select("water_mask").eq(1), 1).int().rename("water_mask")
+        terrain_mask = zeros.where(self.combined_terrain_mask.eq(1), 1).int().rename("terrain_mask")
+
         task_list = list()
         for i in range(grid_size):
-            for key, output_image in output_images.items():
-                feature = ee.Feature(feature_list.get(i))
-                geometry = feature.geometry()
-                task_name = f"y{key}_tile_{i}"
+            feature = ee.Feature(feature_list.get(i))
+            geometry = feature.geometry()
+            for year, image in self.aufeis.items():
+                output_image = image.select("aufeis").multiply(4).int().rename(f"aufeis_{year}")
+                output_image = output_image.addBands(image.select("data_present").int().rename(f"pixel_counts_{year}"))
+                if year == self.start_year:
+                    output_image = output_image.addBands(water_mask).addBands(terrain_mask)
+                task_name = f"y{year}_tile_{i}"
                 task = ee.batch.Export.image.toDrive(image=output_image,   # .unmask(99),
                                                      description=task_name,
                                                      fileNamePrefix=task_name,
@@ -232,12 +206,13 @@ class EEAufeisIdentification(LandsatCollection):
                                                      maxPixels=int(1e10))
                 task.start()
                 task_list.append(task)
+
         # wait for all tasks to complete then download the data
         download_from_google_drive(task_list=task_list,
                                    google_folder=google_folder,
                                    local_download_loc=download_dir,
                                    extract_from_folder=True)
-        return output_images, filtered_grid
+        return filtered_grid
 
     def image_classification(self, image):
         # Get bands and apply classification logic
@@ -412,17 +387,9 @@ class EEAufeisIdentification(LandsatCollection):
         def apply_terrain_mask(img):
             return img.updateMask(self.combined_terrain_mask)
 
-        # calculate most recent year with full day range
-        doy_today = dt.datetime.now().timetuple().tm_yday
-        if doy_today > self.end_doy:
-            end_year = dt.datetime.now().year
-        else:
-            end_year = dt.datetime.now().year - 1
-
         #  calculate single year aufeis information and add it to self.aufeis_investigation_years if necessary
-        self.aufeis_investigation_years = dict()
-        aufeis_all_years = list()
-        for year in range(1985, end_year + 1):
+        self.aufeis = dict()
+        for year in range(self.start_year, self.end_year + 1):
             # extract relevant bands to a working image collection and apply water/cloud masks
             year_collection = (self.collection.select(["snow", "wet_snow_ndwi_score", "cloud", "water"])
                                .filter(ee.Filter.calendarRange(year, year, 'year')))
@@ -438,36 +405,7 @@ class EEAufeisIdentification(LandsatCollection):
                 single_year_aufeis.select("aufeis").gt(0).int().rename("flagged_as_wet_snow"))
             single_year_aufeis = single_year_aufeis.addBands(
                 single_year_aufeis.select("aufeis").multiply(0).add(1).int().rename("data_present"))
-            aufeis_all_years.append(single_year_aufeis)
-            if self.investigation_start_year <= year <= self.investigation_end_year:
-                # single_year_aufeis = single_year_aufeis.clip(self.collection.geometry().bounds())
-                self.aufeis_investigation_years[year] = single_year_aufeis
-
-        # aggregate yearly aufeis information to calculate self.interannual_aufeis
-        aufeis_all_years = ee.ImageCollection(aufeis_all_years)
-        total_aufeis = aufeis_all_years.select("aufeis").sum().rename("total_aufeis")
-        total_years_flagged = aufeis_all_years.select("flagged_as_wet_snow").sum().rename("years_flagged_as_wet_snow")
-        total_years_with_data = aufeis_all_years.select("data_present").sum().rename("years_with_data")
-        aufeis_score = total_aufeis.divide(total_years_flagged).rename("aufeis_score")
-        self.interannual_aufeis = aufeis_score.gt(0.6).where(total_years_flagged.lt(4), 0).rename("interannual_aufeis")
-        """
-        self.interannual_aufeis = aufeis.reduceNeighborhood(reducer=ee.Reducer.mean(),
-                                                            kernel=ee.Kernel.circle(
-                                                                radius=2,
-                                                                units="pixels",
-                                                                normalize=False)).gt(0.3).rename("interannual_aufeis")
-        """
-
-        self.interannual_aufeis = (self.interannual_aufeis.addBands(total_aufeis).addBands(total_years_flagged)
-                                   .addBands(total_years_with_data).addBands(aufeis_score))
-        # self.interannual_aufeis = self.interannual_aufeis.clip(self.collection.geometry().bounds())
-
-        # add constrained_aufeis band to images in self.aufeis_investigation_years
-        for year, image in self.aufeis_investigation_years.items():
-            self.aufeis_investigation_years[year] = (
-                image.addBands(image.select("aufeis")
-                               .multiply(self.interannual_aufeis.select("interannual_aufeis"))
-                               .rename("constrained_aufeis")))
+            self.aufeis[year] = single_year_aufeis
         return
 
     def create_imagery_water_mask(self):
