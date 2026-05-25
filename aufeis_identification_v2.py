@@ -32,9 +32,10 @@ def main():
 
     # establish output directories
     download_dir = Path(working_dir, "downloaded_data")
+    interannual_dir = Path(working_dir, "interannual_constraint")
     vectorized_dir = Path(working_dir, "vectorized")
     output_dir = Path(working_dir, "compiled_aufeis")
-    for dir_path in [download_dir, vectorized_dir, output_dir]:
+    for dir_path in [download_dir, vectorized_dir, output_dir, interannual_dir]:
         dir_path.mkdir(exist_ok=True, parents=True)
 
     # create GEE layers
@@ -50,8 +51,12 @@ def main():
     # submit GEE export tasks and download data from google drive
     aufeis.download_aufeis_data(download_dir=download_dir)
 
+    # constrain aufeis GEE outputs to where interannual aufeis features form
+    lp.interannual_aufeis_constraint(download_dir=download_dir, output_dir=interannual_dir)
+
     # vectorize all bands in downloaded imagery and compile one vector file per band
     lp.vectorize_gee_export(download_dir, vectorized_dir)
+    lp.vectorize_gee_export(interannual_dir, vectorized_dir)
 
     # remove non-aufeis features from yearly aufeis datasets and perform lone-pixel filtering
     aufeis_datasets = vectorized_dir.glob("aufeis_*.geojson")

@@ -25,9 +25,9 @@ def vectorize_gee_export(download_dir: str | Path, output_dir: str | Path, no_da
         download_dir = Path(download_dir)
     if isinstance(output_dir, str):
         output_dir = Path(output_dir)
-    output_dir.mkdir(exist_ok=True)
+    output_dir.mkdir(exist_ok=True, parents=True)
     pyogrio.set_gdal_config_options({"OGR_GEOJSON_MAX_OBJ_SIZE": "0"})
-    scratch.mkdir(exist_ok=True)
+    scratch.mkdir(exist_ok=True, parents=True)
 
     tif_list = download_dir.glob("*.tif")
     working_crs = None

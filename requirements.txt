@@ -10,3 +10,4 @@ google_auth_oauthlib
 pyogrio
 tabulate
 pyyaml
+regex

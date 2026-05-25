@@ -60,7 +60,7 @@ class EEAufeisIdentification(LandsatCollection):
 
         # for data export and download
         self.crs = "EPSG:3979"
-        self.tile_size_px = 1500
+        self.tile_size_px = 5000
 
         self.collection = self.collection.map(self.image_classification)
 
