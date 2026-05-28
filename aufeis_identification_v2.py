@@ -29,6 +29,7 @@ def main():
     cut_off_value = input_param_dict["cut_off_value"]
     clip_to_aoi = input_param_dict["clip_to_aoi"]
     ee_project = input_param_dict["ee_project"]
+    print(working_dir)
 
     # establish output directories
     download_dir = Path(working_dir, "downloaded_data")
@@ -38,36 +39,41 @@ def main():
     for dir_path in [download_dir, vectorized_dir, output_dir, interannual_dir]:
         dir_path.mkdir(exist_ok=True, parents=True)
 
-    # create GEE layers
-    aufeis = EEAufeisIdentification(project_name=ee_project,
-                                    aoi=aoi,
-                                    start_year=start_year,
-                                    end_year=end_year,
-                                    start_doy=100,
-                                    end_doy=240,
-                                    satellites=[5, 7, 8, 9],
-                                    cloud_frac=50,
-                                    clip_to_aoi=clip_to_aoi)
-    # submit GEE export tasks and download data from google drive
-    aufeis.download_aufeis_data(download_dir=download_dir)
-
-    # constrain aufeis GEE outputs to where interannual aufeis features form
-    lp.interannual_aufeis_constraint(download_dir=download_dir, output_dir=interannual_dir)
+    if not ("local_only" in input_param_dict and input_param_dict["local_only"]):
+        # create GEE layers
+        aufeis = EEAufeisIdentification(project_name=ee_project,
+                                        aoi=aoi,
+                                        start_year=start_year,
+                                        end_year=end_year,
+                                        start_doy=100,
+                                        end_doy=240,
+                                        satellites=[5, 7, 8, 9],
+                                        cloud_frac=50,
+                                        clip_to_aoi=clip_to_aoi)
+        # submit GEE export tasks and download data from google drive
+        aufeis.download_aufeis_data(download_dir=download_dir)
+    else:
+        print("Skipping GEE tasks, working off preexisting data.")
 
     # vectorize all bands in downloaded imagery and compile one vector file per band
     lp.vectorize_gee_export(download_dir, vectorized_dir)
-    lp.vectorize_gee_export(interannual_dir, vectorized_dir)
+
+    # constrain aufeis GEE outputs to where interannual aufeis features form
+    # lp.interannual_aufeis_constraint(vectorized_dir)
 
     # remove non-aufeis features from yearly aufeis datasets and perform lone-pixel filtering
     aufeis_datasets = vectorized_dir.glob("aufeis_*.geojson")
+    # aufeis_datasets = vectorized_dir.glob("constrained_aufeis_*.geojson")
+
     year_aufeis_data = dict()
     for aufeis_data_path in aufeis_datasets:
         year = aufeis_data_path.stem.split("_")[-1]
         aufeis_data = gpd.read_file(aufeis_data_path)
-        aufeis_data = aufeis_data.loc[aufeis_data["pixel_value"] > cut_off_value]
+        aufeis_data = aufeis_data.loc[aufeis_data["pixel_value"] != 0]
         aufeis_data["area_m"] = aufeis_data.area
+        aufeis_data = lp.small_or_low_value_filtering(aufeis_data)
         aufeis_data.rename(columns={"pixel_value": f"y_{year}"}, inplace=True)
-        year_aufeis_data[year] = lp.remove_lone_pixels_geopandas(aufeis_data, "area_m")
+        year_aufeis_data[year] = aufeis_data
 
     # union yearly aufeis datasets into one dataset
     compiled_aufeis = None
@@ -77,8 +83,8 @@ def main():
         else:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
-                compiled_aufeis = gpd.overlay(compiled_aufeis, dataset[[f"y_{year}", "geometry"]],
-                                              how="union").explode()
+                compiled_aufeis = (compiled_aufeis.overlay(dataset[[f"y_{year}", "geometry"]], how="union")
+                                   .explode().reset_index(drop=True))
     compiled_aufeis["area_m"] = compiled_aufeis.area
 
     # calculate return frequency
@@ -89,7 +95,8 @@ def main():
         compiled_aufeis.loc[ix, "frequency"] = compiled_aufeis.loc[ix, "frequency"] + 1
 
     # perform small-infrequent pixel filtering and aggregate features
-    frequency_masked = lp.frequency_masking_geopandas(compiled_aufeis, "area_m", "frequency")
+    frequency_masked = lp.small_infrequent_pixel_filtering(
+        data=compiled_aufeis, area_field="area_m", frequency_field="frequency")
     final_aufeis, aggregated_aufeis = lp.aggregate_aufeis(frequency_masked)
 
     # export final output

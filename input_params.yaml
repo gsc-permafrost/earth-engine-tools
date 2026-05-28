@@ -8,5 +8,6 @@ aoi:
   - [-111.93, 64.53]
   - [-113.497, 64.53]
 working_dir: 'D:\icing_mapping\mosaic_testing\large_test_area'
-cut_off_value: 2
+cut_off_value: null
 clip_to_aoi: True
+local_only: True
